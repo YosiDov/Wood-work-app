@@ -1,5 +1,5 @@
 import type { Project, WoodId } from './types';
-import { partVolume, sortedDims } from './geometry';
+import { hasCut, partVolume, sortedDims } from './geometry';
 import { SHEET_AREA_M2, wood } from './woods';
 
 export interface CutRow {
@@ -10,6 +10,8 @@ export interface CutRow {
   W: number;
   T: number;
   round: boolean;
+  /** end cut angles, or null for square ends */
+  angles: [number, number] | null;
   wood: WoodId;
   volume: number;
   weight: number;
@@ -32,7 +34,8 @@ export const cutList = (project: Project) => {
   for (const p of project.parts) {
     const [L, W, T] = sortedDims(p.size);
     const round = p.shape === 'rod';
-    const key = `${p.wood}|${round ? 'r' : 'b'}|${L.toFixed(1)}|${W.toFixed(1)}|${T.toFixed(1)}`;
+    const angles: [number, number] | null = hasCut(p) ? (p.cut!.map((a) => Math.round(Math.abs(a) * 10) / 10).sort((a, b) => a - b) as [number, number]) : null;
+    const key = `${p.wood}|${round ? 'r' : 'b'}|${L.toFixed(1)}|${W.toFixed(1)}|${T.toFixed(1)}|${angles ? angles.join('/') : ''}`;
     const v = partVolume(p);
     const w = wood(p.wood);
     const price = project.prices[p.wood] ?? w.price;
@@ -45,7 +48,7 @@ export const cutList = (project: Project) => {
       r.cost += v * price;
       r.ids.push(p.id);
     } else {
-      rows.set(key, { key, names: [p.name], qty: 1, L, W, T, round, wood: p.wood, volume: v, weight: v * w.density, cost: v * price, ids: [p.id] });
+      rows.set(key, { key, names: [p.name], qty: 1, L, W, T, round, angles, wood: p.wood, volume: v, weight: v * w.density, cost: v * price, ids: [p.id] });
     }
   }
   const list = [...rows.values()].sort((a, b) => (a.wood === b.wood ? b.T - a.T || b.L - a.L : a.wood.localeCompare(b.wood)));
@@ -65,9 +68,12 @@ export const cutList = (project: Project) => {
   return { rows: list, totals: [...totals.values()] };
 };
 
+/** "32°" for both ends alike, "32° / 45°" otherwise, "" for square ends */
+export const cutLabel = (a: [number, number] | null) => (!a ? '' : a[0] === a[1] ? `${a[0]}°` : `${a[0]}° / ${a[1]}°`);
+
 export const cutListCSV = (project: Project): string => {
   const { rows } = cutList(project);
-  const head = ['כמות', 'שם', 'אורך (מ״מ)', 'רוחב (מ״מ)', 'עובי (מ״מ)', 'צורה', 'חומר', 'משקל (ק״ג)', 'עלות משוערת (₪)'];
+  const head = ['כמות', 'שם', 'אורך (מ״מ)', 'רוחב (מ״מ)', 'עובי (מ״מ)', 'צורה', 'זווית חיתוך בקצוות', 'חומר', 'משקל (ק״ג)', 'עלות משוערת (₪)'];
   const esc = (v: string | number) => {
     const s = String(v);
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -75,7 +81,7 @@ export const cutListCSV = (project: Project): string => {
   const lines = [head.map(esc).join(',')];
   for (const r of rows) {
     lines.push(
-      [r.qty, r.names.join(' / '), r.L.toFixed(1), r.round ? `Ø${r.W.toFixed(1)}` : r.W.toFixed(1), r.round ? '' : r.T.toFixed(1), r.round ? 'עגול' : 'מלבני', wood(r.wood).name, r.weight.toFixed(2), Math.round(r.cost)]
+      [r.qty, r.names.join(' / '), r.L.toFixed(1), r.round ? `Ø${r.W.toFixed(1)}` : r.W.toFixed(1), r.round ? '' : r.T.toFixed(1), r.round ? 'עגול' : 'מלבני', cutLabel(r.angles), wood(r.wood).name, r.weight.toFixed(2), Math.round(r.cost)]
         .map(esc)
         .join(','),
     );

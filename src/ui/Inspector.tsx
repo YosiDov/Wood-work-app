@@ -6,6 +6,7 @@ import {
   Copy,
   Crosshair,
   Group as GroupIcon,
+  RotateCcw,
   RotateCw,
   Square,
   Trash2,
@@ -13,12 +14,13 @@ import {
   Ungroup,
   X,
 } from 'lucide-react';
-import { useStore } from '../model/store';
+import { groupTotalQ, useStore } from '../model/store';
 import { analyze, STATUS_LABEL, type Analysis, type PartResult } from '../model/analysis';
 import { autoLoad } from '../model/analysis';
 import type { Group, Part, Project, Vec3 } from '../model/types';
 import { TEMPLATE_MAP } from '../model/templates';
-import { boxOfParts, boxSize, longestAxis } from '../model/geometry';
+import { boxOfParts, boxSize, hasCut, longestAxis, quatToAngles } from '../model/geometry';
+import { fromQ } from '../model/geometry';
 import { wood } from '../model/woods';
 import { NumField, Segmented, Slider, Toggle, WoodPicker } from './controls';
 import { PartIcon, TemplateIcon, TipIcon } from './icons';
@@ -131,13 +133,9 @@ const PartInspector = ({ p, project, res }: { p: Part; project: Project; res?: P
           )}
         </div>
         <div className="actions">
-          <button type="button" className="act" onClick={() => st.rotateSelection(1)} title="סובב 90° (R)">
-            <RotateCw size={18} />
-            <span>סובב</span>
-          </button>
-          <button type="button" className="act" onClick={() => st.rotateSelection(0)} title="השכב / העמד">
-            <TipIcon size={18} />
-            <span>השכב</span>
+          <button type="button" className="act" onClick={() => getViewport()?.frame(true)} title="התמקד (F)">
+            <Crosshair size={18} />
+            <span>התמקד</span>
           </button>
           <button type="button" className="act" onClick={() => st.duplicateSelection()} title="שכפל (Ctrl+D)">
             <Copy size={18} />
@@ -149,6 +147,19 @@ const PartInspector = ({ p, project, res }: { p: Part; project: Project; res?: P
           </button>
         </div>
       </section>
+
+      <RotationPanel angles={quatToAngles(p.q)} />
+
+      {p.shape === 'box' && (
+        <details className="insp-sec fold" open={hasCut(p)}>
+          <summary>חיתוך בזווית בקצוות</summary>
+          <div className="fields3 two">
+            <NumField label="קצה א׳" unit="°" value={p.cut?.[0] ?? 0} min={-75} max={75} step={5} onCommit={(v) => set({ cut: [v, p.cut?.[1] ?? 0] })} />
+            <NumField label="קצה ב׳" unit="°" value={p.cut?.[1] ?? 0} min={-75} max={75} step={5} onCommit={(v) => set({ cut: [p.cut?.[0] ?? 0, v] })} />
+          </div>
+          <p className="hint">0 = חיתוך ישר. אותה זווית בשני הקצוות = קצוות מקבילים (כמו באיקס); זוויות הפוכות = חיתוך מיטר. האורך נמדד מקצה לקצה הארוך.</p>
+        </details>
+      )}
 
       {res && <StrengthCard p={p} res={res} project={project} />}
 
@@ -210,6 +221,7 @@ const Meter = ({ label, value, limit, unit }: { label: string; value: number; li
 
 const STATUS_HINT: Partial<Record<PartResult['status'], string>> = {
   front: 'דלת, חזית או ידית. לא נושא עומס, ולכן לא נבדק.',
+  angled: 'חלק משופע (בזווית). החוזק שלו לא מחושב; בדקו אותו בנפרד.',
   attached: 'מחובר מהצד בברגים. אין עליו עומס כפיפה לבדוק.',
   supported: 'נשען לכל אורכו, כך שאינו מתכופף.',
   anchored: 'מעוגן לקיר ומעביר אליו את העומס.',
@@ -467,12 +479,10 @@ const GroupInspector = ({ g, project, analysis }: { g: Group; project: Project; 
         )}
       </section>
 
+      <RotationPanel angles={g.template && !g.custom ? quatToAngles(fromQ(groupTotalQ(g))) : null} />
+
       <section className="insp-sec">
         <div className="actions">
-          <button type="button" className="act" onClick={() => st.rotateSelection(1)} title="סובב 90° (R)">
-            <RotateCw size={18} />
-            <span>סובב</span>
-          </button>
           <button type="button" className="act" onClick={() => st.duplicateSelection()} title="שכפל (Ctrl+D)">
             <Copy size={18} />
             <span>שכפל</span>
@@ -532,10 +542,6 @@ const MultiInspector = ({ ids, project, analysis }: { ids: string[]; project: Pr
             <GroupIcon size={18} />
             <span>קבץ</span>
           </button>
-          <button type="button" className="act" onClick={() => st.rotateSelection(1)}>
-            <RotateCw size={18} />
-            <span>סובב</span>
-          </button>
           <button type="button" className="act" onClick={() => st.duplicateSelection()}>
             <Copy size={18} />
             <span>שכפל</span>
@@ -546,7 +552,66 @@ const MultiInspector = ({ ids, project, analysis }: { ids: string[]; project: Pr
           </button>
         </div>
       </section>
+      <RotationPanel angles={null} />
     </>
+  );
+};
+
+// ───────────────────────────────────────────────── rotation
+
+const RotationPanel = ({ angles }: { angles: Vec3 | null }) => {
+  const st = useStore.getState();
+  const tool = useStore((s) => s.tool);
+  const set = (k: number, v: number) => {
+    if (!angles) return;
+    const a = [...angles] as Vec3;
+    a[k] = v;
+    st.setRotation(a);
+  };
+  return (
+    <section className="insp-sec rot-sec" aria-label="סיבוב">
+      <div className="rot-head">
+        <h3>סיבוב</h3>
+        <button
+          type="button"
+          className={`chip ${tool === 'rotate' ? 'on' : ''}`}
+          aria-pressed={tool === 'rotate'}
+          onClick={() => st.set({ tool: tool === 'rotate' ? 'move' : 'rotate' })}
+          title="טבעות סיבוב בתלת־ממד (R)"
+        >
+          <RotateCw size={14} />
+          <span>טבעות</span>
+        </button>
+      </div>
+      <div className="rot-steps">
+        <button type="button" className="act" onClick={() => st.rotateSelection(1, 90)} title="90° נגד כיוון השעון">
+          <RotateCcw size={18} />
+          <span>90°</span>
+        </button>
+        <button type="button" className="act" onClick={() => st.rotateSelection(1, -90)} title="90° עם כיוון השעון">
+          <RotateCw size={18} />
+          <span>90°</span>
+        </button>
+        <button type="button" className="act" onClick={() => st.rotateSelection(0, 90)} title="השכב קדימה / העמד">
+          <TipIcon size={18} />
+          <span>קדימה</span>
+        </button>
+        <button type="button" className="act" onClick={() => st.rotateSelection(2, 90)} title="השכב על הצד">
+          <span className="tip-side">
+            <TipIcon size={18} />
+          </span>
+          <span>לצד</span>
+        </button>
+      </div>
+      {angles && (
+        <div className="fields3">
+          <NumField label="סיבוב" unit="°" value={angles[0]} min={-360} max={360} step={15} onCommit={(v) => set(0, v)} />
+          <NumField label="הטיה קדימה" unit="°" value={angles[1]} min={-360} max={360} step={15} onCommit={(v) => set(1, v)} />
+          <NumField label="הטיה לצד" unit="°" value={angles[2]} min={-360} max={360} step={15} onCommit={(v) => set(2, v)} />
+        </div>
+      )}
+      {tool === 'rotate' && <p className="hint">גררו טבעת צבעונית כדי לסובב. הסיבוב נצמד כל 15°.</p>}
+    </section>
   );
 };
 

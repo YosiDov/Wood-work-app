@@ -74,6 +74,11 @@ export const App = () => {
         st.duplicateSelection();
         return;
       }
+      if (mod && code === 'KeyA') {
+        e.preventDefault();
+        st.selectAll();
+        return;
+      }
       if (mod && code === 'KeyG') {
         e.preventDefault();
         st.groupSelection();
@@ -112,7 +117,9 @@ export const App = () => {
           st.set({ tool: 'resize' });
           break;
         case 'KeyR':
-          st.rotateSelection(1);
+          // first press picks the rotate tool, the next ones turn 90°
+          if (st.tool !== 'rotate') st.set({ tool: 'rotate' });
+          else st.rotateSelection(1, e.shiftKey ? -90 : 90);
           break;
         case 'KeyB':
           st.set({ strength: !st.strength });

@@ -1,8 +1,8 @@
 import * as THREE from 'three';
 import { ColladaLoader } from 'three/examples/jsm/loaders/ColladaLoader.js';
-import type { Part, Project, Vec3, WoodId } from '../model/types';
+import type { Part, Project, Quat, Vec3, WoodId } from '../model/types';
 import { WOODS, wood } from '../model/woods';
-import { hashSeed, longestAxis, uid } from '../model/geometry';
+import { applyCut, bakeQuarter, fromQ, hashSeed, hasCut, isIdentityQ, longestAxis, posFromCenter, rotatedBox, uid } from '../model/geometry';
 
 /*
  * Collada 1.4.1 writer. Every part becomes a node with its own mesh, grouped under a node per
@@ -22,13 +22,25 @@ const rgb = (hex: string) => {
 
 const f = (v: number) => (Math.round(v * 1000) / 1000).toString();
 
-const boxMesh = (size: Vec3) => {
+const boxMesh = (size: Vec3, cut?: [number, number]) => {
   const [x, y, z] = size.map((s) => s / 2);
   const pos = [
     [-x, -y, -z], [x, -y, -z], [x, y, -z], [-x, y, -z],
     [-x, -y, z], [x, -y, z], [x, y, z], [-x, y, z],
   ];
-  const nrm = [[0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0]];
+  if (cut) pos.forEach((pt) => applyCut(pt, size, cut));
+  const nrm: number[][] = [[0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0]];
+  if (cut) {
+    // end faces are no longer square to the board: recompute each face normal
+    const faces = [[0, 3, 2], [4, 5, 6], [0, 4, 7], [1, 2, 6], [0, 1, 5], [3, 7, 6]];
+    faces.forEach(([a, b, c], i) => {
+      const u = [0, 1, 2].map((k) => pos[b][k] - pos[a][k]);
+      const v = [0, 1, 2].map((k) => pos[c][k] - pos[a][k]);
+      const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+      const l = Math.hypot(n[0], n[1], n[2]) || 1;
+      nrm[i] = n.map((x) => x / l);
+    });
+  }
   // quads (counter-clockwise from outside) → normal index
   const quads: [number[], number][] = [
     [[0, 3, 2, 1], 0],
@@ -109,7 +121,7 @@ export const exportCollada = (project: Project): string => {
   const geoms: string[] = [];
   const nodeOf = (p: Part, i: number) => {
     const gid = `g${i}`;
-    const m = p.shape === 'rod' ? rodMesh(p.size) : boxMesh(p.size);
+    const m = p.shape === 'rod' ? rodMesh(p.size) : boxMesh(p.size, hasCut(p) ? p.cut : undefined);
     const posArr = m.pos.flat().map(f).join(' ');
     const nrmArr = m.nrm.flat().map(f).join(' ');
     geoms.push(
@@ -121,7 +133,14 @@ export const exportCollada = (project: Project): string => {
         `</mesh></geometry>`,
     );
     const c = [p.pos[0] + p.size[0] / 2, p.pos[1] + p.size[1] / 2, p.pos[2] + p.size[2] / 2];
-    return `<node id="n${i}" name="${xml(p.name)}" type="NODE"><translate sid="location">${c.map(f).join(' ')}</translate><instance_geometry url="#${gid}" name="${xml(p.name)}"><bind_material><technique_common><instance_material symbol="wood" target="#mat-${p.wood}"/></technique_common></bind_material></instance_geometry></node>`;
+    let rotate = '';
+    if (!isIdentityQ(p.q)) {
+      const [x, y, z, w] = p.q!;
+      const ang = 2 * Math.acos(Math.min(1, Math.max(-1, w)));
+      const sn = Math.sqrt(Math.max(1e-12, 1 - w * w));
+      rotate = `<rotate sid="rotate">${f(x / sn)} ${f(y / sn)} ${f(z / sn)} ${f((ang * 180) / Math.PI)}</rotate>`;
+    }
+    return `<node id="n${i}" name="${xml(p.name)}" type="NODE"><translate sid="location">${c.map(f).join(' ')}</translate>${rotate}<instance_geometry url="#${gid}" name="${xml(p.name)}"><bind_material><technique_common><instance_material symbol="wood" target="#mat-${p.wood}"/></technique_common></bind_material></instance_geometry></node>`;
   };
 
   const index = new Map(project.parts.map((p, i) => [p.id, i]));
@@ -180,6 +199,11 @@ export const sanitizeProject = (raw: unknown): Project => {
   if (!r || !Array.isArray(r.parts)) throw new Error('bad project');
   const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
   const vec = (v: unknown, d: Vec3): Vec3 => (Array.isArray(v) && v.length === 3 ? (v.map((x, i) => num(x, d[i])) as Vec3) : d);
+  const quat = (v: unknown): Quat | undefined => {
+    if (!Array.isArray(v) || v.length !== 4 || !v.every((x) => typeof x === 'number' && Number.isFinite(x))) return undefined;
+    const q = fromQ(new THREE.Quaternion(v[0], v[1], v[2], v[3]));
+    return isIdentityQ(q) ? undefined : q;
+  };
   const parts: Part[] = r.parts.map((p: Partial<Part>) => ({
     id: typeof p.id === 'string' ? p.id : uid(),
     name: typeof p.name === 'string' ? p.name : 'חלק',
@@ -195,13 +219,18 @@ export const sanitizeProject = (raw: unknown): Project => {
     seed: num(p.seed, Math.random()),
     kind: p.kind ?? 'board',
     matRole: p.matRole,
+    q: quat(p.q),
+    cut:
+      Array.isArray(p.cut) && p.cut.length === 2 && p.cut.every((x) => typeof x === 'number' && Number.isFinite(x))
+        ? ([Math.max(-75, Math.min(75, p.cut[0])), Math.max(-75, Math.min(75, p.cut[1]))] as [number, number])
+        : undefined,
   }));
   const groups = Array.isArray(r.groups) ? r.groups.filter((g) => g && typeof g.id === 'string') : [];
   return {
     version: 1,
     name: typeof r.name === 'string' ? r.name : 'פרויקט',
     parts,
-    groups: groups.map((g) => ({ ...g, origin: vec(g.origin, [0, 0, 0]), rot: num(g.rot, 0), params: g.params ?? {}, custom: !!g.custom, template: g.template ?? null })),
+    groups: groups.map((g) => ({ ...g, origin: vec(g.origin, [0, 0, 0]), rot: num(g.rot, 0), q: quat(g.q), params: g.params ?? {}, custom: !!g.custom, template: g.template ?? null })),
     designLoad: num(r.designLoad, 100),
     prices: r.prices ?? {},
   };
@@ -221,28 +250,44 @@ export const importCollada = (text: string, fileName: string): { project: Projec
   if (!res?.scene) throw new Error('empty');
   const scene = res.scene;
   scene.updateMatrixWorld(true);
-  const raw: { name: string; min: THREE.Vector3; max: THREE.Vector3 }[] = [];
+  // each object keeps its own orientation: size from its local box, centre and rotation from the scene
+  const raw: { name: string; c: Vec3; size: Vec3; q?: Quat }[] = [];
   scene.traverse((o) => {
-    if (!(o as THREE.Mesh).isMesh || raw.length >= 400) return;
-    const b = new THREE.Box3().setFromObject(o);
-    if (b.isEmpty()) return;
-    raw.push({ name: o.name || o.parent?.name || 'חלק', min: b.min.clone().multiplyScalar(1000), max: b.max.clone().multiplyScalar(1000) });
+    const m = o as THREE.Mesh;
+    if (!m.isMesh || raw.length >= 400) return;
+    m.geometry.computeBoundingBox();
+    const gb = m.geometry.boundingBox;
+    if (!gb || gb.isEmpty()) return;
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scl = new THREE.Vector3();
+    m.matrixWorld.decompose(pos, quat, scl);
+    const sz = gb.getSize(new THREE.Vector3());
+    const size: Vec3 = [sz.x * Math.abs(scl.x) * 1000, sz.y * Math.abs(scl.y) * 1000, sz.z * Math.abs(scl.z) * 1000].map((v) => Math.max(1, Math.round(v * 10) / 10)) as Vec3;
+    const c = gb.getCenter(new THREE.Vector3()).applyMatrix4(m.matrixWorld).multiplyScalar(1000);
+    const baked = bakeQuarter(size, fromQ(quat));
+    raw.push({ name: o.name || o.parent?.name || 'חלק', c: [c.x, c.y, c.z], size: baked.size, q: baked.q });
   });
   if (!raw.length) throw new Error('empty');
-  const all = new THREE.Box3();
-  raw.forEach((r) => all.expandByPoint(r.min).expandByPoint(r.max));
-  const c = all.getCenter(new THREE.Vector3());
+  const all = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+  for (const r of raw) {
+    const b = rotatedBox(r.c, r.size, r.q);
+    for (let k = 0; k < 3; k++) {
+      all.min[k] = Math.min(all.min[k], b.min[k]);
+      all.max[k] = Math.max(all.max[k], b.max[k]);
+    }
+  }
+  const shift: Vec3 = [-(all.min[0] + all.max[0]) / 2, -all.min[1], -(all.min[2] + all.max[2]) / 2];
   const groupId = uid();
   const parts: Part[] = raw.map((r, i) => {
-    const size = r.max.clone().sub(r.min);
     const id = uid() + i;
-    const s: Vec3 = [Math.max(1, size.x), Math.max(1, size.y), Math.max(1, size.z)];
+    const c: Vec3 = [r.c[0] + shift[0], r.c[1] + shift[1], r.c[2] + shift[2]];
     return {
       id,
       name: r.name.replace(/[-_]/g, ' ').slice(0, 40),
       groupId,
-      pos: [r.min.x - c.x, r.min.y - all.min.y, r.min.z - c.z].map((v) => Math.round(v * 10) / 10) as Vec3,
-      size: s.map((v) => Math.round(v * 10) / 10) as Vec3,
+      pos: posFromCenter(c, r.size).map((v) => Math.round(v * 10) / 10) as Vec3,
+      size: r.size,
       wood: 'pine',
       shape: 'box',
       role: 'structure',
@@ -251,6 +296,7 @@ export const importCollada = (text: string, fileName: string): { project: Projec
       loadType: 'udl',
       seed: hashSeed(id),
       kind: 'board',
+      q: r.q,
     };
   });
   const base = fileName.replace(/\.[^.]+$/, '');

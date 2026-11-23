@@ -1,6 +1,6 @@
-import type { Part, Project } from './types';
+import type { Part, Project, Vec3 } from './types';
 import { wood } from './woods';
-import { boxOfParts, partVolume } from './geometry';
+import { boxOfParts, levelFrame, partCenter, partVolume } from './geometry';
 
 /*
  * Structural check, simplified Eurocode 5 (EN 1995-1-1) approach:
@@ -15,7 +15,7 @@ import { boxOfParts, partVolume } from './geometry';
  *  - columns: EN 1995 6.3.2 buckling factor k_c with effective length between bracing points
  */
 
-export type Status = 'ok' | 'warn' | 'bad' | 'floating' | 'attached' | 'supported' | 'anchored' | 'front';
+export type Status = 'ok' | 'warn' | 'bad' | 'floating' | 'attached' | 'supported' | 'anchored' | 'front' | 'angled';
 export type Govern = 'sag' | 'stress' | 'buckle';
 
 export interface Segment {
@@ -58,6 +58,8 @@ export interface PartResult {
   kc?: number;
   supports: string[];
   overlaps: string[];
+  /** yaw of the frame the segments are measured in (radians) */
+  frameYaw: number;
 }
 
 export interface Analysis {
@@ -78,10 +80,15 @@ const FLOOR = 'floor';
 
 interface Info {
   p: Part;
+  /** box in the part's own level frame (turned by `theta` about Y) */
   min: number[];
   max: number[];
+  size: Vec3;
   member: 'beam' | 'column' | 'none';
   axis: 0 | 2;
+  theta: number;
+  /** parts touch only when they share a frame; null = tilted */
+  cls: number | null;
 }
 
 interface Support {
@@ -92,7 +99,9 @@ interface Support {
 
 export const autoLoad = (p: Part, designLoad: number): number => {
   if (p.role !== 'structure' || p.anchored) return 0;
-  const [sx, sy, sz] = p.size;
+  const fr = levelFrame(p.size, p.q);
+  if (!fr) return 0;
+  const [sx, sy, sz] = fr.size;
   if (p.shape === 'rod') {
     if (sy >= Math.max(sx, sz)) return 0;
     return Math.round(25 * (Math.max(sx, sz) / 1000));
@@ -107,10 +116,10 @@ const stiffness = (I: Info): number => {
   const other = I.axis === 0 ? 2 : 0;
   const E = wood(p.wood).E;
   if (p.shape === 'rod') {
-    const d = Math.min(p.size[1], p.size[other]);
+    const d = Math.min(I.size[1], I.size[other]);
     return (E * Math.PI * d ** 4) / 64;
   }
-  return (E * p.size[other] * p.size[1] ** 3) / 12;
+  return (E * I.size[other] * I.size[1] ** 3) / 12;
 };
 
 const overlap1 = (a0: number, a1: number, b0: number, b1: number) => Math.min(a1, b1) - Math.max(a0, b0);
@@ -128,11 +137,18 @@ export const analyze = (project: Project): Analysis => {
 const runAnalysis = (project: Project): Analysis => {
   const parts = project.parts;
   const infos: Info[] = parts.map((p) => {
-    const min = [p.pos[0], p.pos[1], p.pos[2]];
-    const max = [p.pos[0] + p.size[0], p.pos[1] + p.size[1], p.pos[2] + p.size[2]];
-    const horiz = Math.max(p.size[0], p.size[2]);
-    const member = p.role === 'front' ? 'none' : horiz >= p.size[1] ? 'beam' : 'column';
-    return { p, min, max, member, axis: p.size[0] >= p.size[2] ? 0 : 2 };
+    const fr = levelFrame(p.size, p.q);
+    const size = fr ? fr.size : p.size;
+    const theta = fr ? fr.theta : 0;
+    const c = partCenter(p);
+    const cs = Math.cos(theta);
+    const sn = Math.sin(theta);
+    const fc = [cs * c[0] - sn * c[2], c[1], sn * c[0] + cs * c[2]];
+    const min = [fc[0] - size[0] / 2, fc[1] - size[1] / 2, fc[2] - size[2] / 2];
+    const max = [fc[0] + size[0] / 2, fc[1] + size[1] / 2, fc[2] + size[2] / 2];
+    const horiz = Math.max(size[0], size[2]);
+    const member = p.role === 'front' || !fr ? 'none' : horiz >= size[1] ? 'beam' : 'column';
+    return { p, min, max, size, member, axis: size[0] >= size[2] ? 0 : 2, theta, cls: fr ? Math.round(theta * 1e4) : null };
   });
   const byId = new Map(infos.map((i) => [i.p.id, i]));
   const n = infos.length;
@@ -146,6 +162,7 @@ const runAnalysis = (project: Project): Analysis => {
     const A = infos[i];
     for (let j = i + 1; j < n; j++) {
       const B = infos[j];
+      if (A.cls === null || A.cls !== B.cls) continue;
       const ov = [0, 1, 2].map((k) => overlap1(A.min[k], A.max[k], B.min[k], B.max[k]));
       if (ov.every((o) => o > 1)) {
         if (A.p.role === 'structure' && B.p.role === 'structure' && ov.every((o) => o > 2)) {
@@ -197,6 +214,12 @@ const runAnalysis = (project: Project): Analysis => {
           if (!ok) continue;
           const at = t.side === -1 ? I.min[a] : I.max[a];
           sup.push({ id: S.p.id, lo: at, hi: at });
+        } else if (t.k !== 1) {
+          // a post screwed to the board's front or back edge holds it at that spot
+          // (wide panels such as a back are left out: they are nailed on, not load-bearing)
+          const postLike = (S.member === 'column' || S.p.anchored) && S.size[a] <= 0.25 * (I.max[a] - I.min[a]);
+          if (!postLike) continue;
+          sup.push({ id: S.p.id, lo: Math.max(I.min[a], S.min[a]), hi: Math.min(I.max[a], S.max[a]) });
         }
       }
     } else {
@@ -286,9 +309,10 @@ const runAnalysis = (project: Project): Analysis => {
       E: W.E,
       supports: [...new Set(supports[i].map((s) => s.id))],
       overlaps: overlapsMap.get(p.id) ?? [],
+      frameYaw: I.theta,
     };
     if (I.member === 'none') {
-      results.set(p.id, { ...base, status: 'front' });
+      results.set(p.id, { ...base, status: I.cls === null && p.role === 'structure' ? 'angled' : 'front' });
       return;
     }
     if (p.anchored) {
@@ -351,12 +375,12 @@ const checkBeam = (I: Info, sup: Support[], base: PartResult, selfN: number, rec
   let Iy: number;
   let Wel: number;
   if (p.shape === 'rod') {
-    const d = Math.min(p.size[1], p.size[other]);
+    const d = Math.min(I.size[1], I.size[other]);
     Iy = (Math.PI * d ** 4) / 64;
     Wel = (Math.PI * d ** 3) / 32;
   } else {
-    const bw = p.size[other];
-    const h = p.size[1];
+    const bw = I.size[other];
+    const h = I.size[1];
     Iy = (bw * h ** 3) / 12;
     Wel = (bw * h ** 2) / 6;
   }
@@ -376,7 +400,7 @@ const checkBeam = (I: Info, sup: Support[], base: PartResult, selfN: number, rec
   const lastHi = merged[merged.length - 1][1];
   if (I.max[a] - lastHi > 2) segs.push({ kind: 'cant', a: lastHi, b: I.max[a], fixed: 'a' });
   // overhangs shorter than ~4× the depth of the section behave as fully supported
-  const depth = p.shape === 'rod' ? Math.min(p.size[1], p.size[other]) : p.size[1];
+  const depth = p.shape === 'rod' ? Math.min(I.size[1], I.size[other]) : I.size[1];
   for (let k = segs.length - 1; k >= 0; k--) {
     if (segs[k].kind === 'cant' && segs[k].b - segs[k].a < Math.max(40, 4 * depth)) segs.splice(k, 1);
   }
@@ -472,12 +496,12 @@ const checkColumn = (
   let A: number;
   let i: number;
   if (p.shape === 'rod') {
-    const d = Math.min(p.size[0], p.size[2]);
+    const d = Math.min(I.size[0], I.size[2]);
     A = (Math.PI * d * d) / 4;
     i = d / 4;
   } else {
-    const t = Math.min(p.size[0], p.size[2]);
-    const w = Math.max(p.size[0], p.size[2]);
+    const t = Math.min(I.size[0], I.size[2]);
+    const w = Math.max(I.size[0], I.size[2]);
     A = t * w;
     i = t / Math.sqrt(12);
   }
@@ -522,4 +546,5 @@ export const STATUS_LABEL: Record<Status, string> = {
   supported: 'נשען לכל אורכו',
   anchored: 'מעוגן לקיר',
   front: 'חזית',
+  angled: 'בזווית',
 };

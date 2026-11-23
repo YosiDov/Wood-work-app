@@ -7,10 +7,10 @@ import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import type { Part, Project, Vec3, ViewMode } from '../model/types';
-import { markCustom, selectedPartIds, useStore } from '../model/store';
+import { markCustom, rotateProject, rotationPivot, selectedPartIds, useStore } from '../model/store';
 import { analyze, type PartResult, type Segment } from '../model/analysis';
-import { boxCenter, boxOfParts, boxSize, type Box3 } from '../model/geometry';
-import { axisParam } from '../model/templates';
+import { boxCenter, boxOfParts, boxSize, partBox, partCenter, posFromCenter, toQ, type Box3 } from '../model/geometry';
+import { axisParam, groupCenter, groupRotExtents } from '../model/templates';
 import { buildPartGeometry } from './boardGeometry';
 import { cuttingMatTexture, woodMaterials } from './textures';
 
@@ -33,9 +33,23 @@ interface PartObj {
 
 interface Handle {
   mesh: THREE.Mesh;
+  /** axis of the part's (or piece's) own box */
   axis: number;
   sign: 1 | -1;
   base: THREE.Vector3;
+  /** outward direction in the world */
+  dir: THREE.Vector3;
+}
+
+/** the selection's own box: a single part or template piece keeps its rotation */
+interface SelFrame {
+  c: THREE.Vector3;
+  q: THREE.Quaternion;
+  size: Vec3;
+  part?: Part;
+  groupId?: string;
+  rot: number;
+  editable: boolean;
 }
 
 const beamAxis = (p: Part): number | null => {
@@ -44,7 +58,7 @@ const beamAxis = (p: Part): number | null => {
   return p.size[0] >= p.size[2] ? 0 : 2;
 };
 
-const geomKey = (p: Part) => `${p.size.join(',')}|${p.shape}|${p.wood}|${p.seed}`;
+const geomKey = (p: Part) => `${p.size.join(',')}|${p.shape}|${p.wood}|${p.seed}|${p.cut ? p.cut.join(',') : ''}`;
 
 const fmt = (v: number) => {
   const r = Math.round(v * 10) / 10;
@@ -127,12 +141,12 @@ export class Viewport {
   private resizeDrag: {
     h: Handle;
     plane: THREE.Plane;
+    base0: THREE.Vector3;
     grab: number;
-    part?: Part;
-    groupId?: string;
-    box: Box3;
+    frame: SelFrame;
     pointerId: number;
   } | null = null;
+  private rotDrag: { start: Project; pivot: Vec3; floor: number } | null = null;
   private down: { x: number; y: number; t: number; gizmo: boolean } | null = null;
   private lastClick: { id: string; t: number } | null = null;
   private justDragged = 0;
@@ -215,6 +229,10 @@ export class Viewport {
     this.tc.setSpace('world');
     this.tc.setSize(matchMedia('(pointer: coarse)').matches ? 1.35 : 1);
     this.tc.setColors(new THREE.Color('#d9534f'), new THREE.Color('#3f9e5a'), new THREE.Color('#3a78c2'), new THREE.Color(TAPE));
+    this.tc.setRotationSnap(THREE.MathUtils.degToRad(15));
+    // only the three axis rings: free trackball spinning is hard to control
+    (this.tc as unknown as { showXYZE: boolean; showE: boolean }).showXYZE = false;
+    (this.tc as unknown as { showXYZE: boolean; showE: boolean }).showE = false;
     const helper = this.tc.getHelper();
     helper.renderOrder = 1000;
     this.scene.add(helper);
@@ -222,10 +240,11 @@ export class Viewport {
     this.tc.addEventListener('dragging-changed', (e) => {
       this.controls.enabled = !(e as unknown as { value: boolean }).value;
     });
-    this.tc.addEventListener('mouseDown', () => this.startMove());
-    this.tc.addEventListener('objectChange', () => this.applyMove());
+    this.tc.addEventListener('mouseDown', () => (this.tc.mode === 'rotate' ? this.startRotate() : this.startMove()));
+    this.tc.addEventListener('objectChange', () => (this.tc.mode === 'rotate' ? this.applyRotate() : this.applyMove()));
     this.tc.addEventListener('mouseUp', () => {
       this.moveDrag = null;
+      this.rotDrag = null;
       this.justDragged = performance.now();
       this.sync();
     });
@@ -372,11 +391,13 @@ export class Viewport {
     const selIds = new Set(selectedPartIds(st));
     for (const o of this.objs.values()) {
       const p = o.part;
-      const c = new THREE.Vector3(p.pos[0] + p.size[0] / 2, p.pos[1] + p.size[1] / 2, p.pos[2] + p.size[2] / 2);
+      const c = new THREE.Vector3(...partCenter(p));
+      o.holder.quaternion.copy(toQ(p.q));
       if (st.explode > 0) {
         const gc = (p.groupId && centers.get(p.groupId)) || overall;
         const off = c.clone().sub(gc).multiplyScalar(st.explode * 0.9);
-        off.y = Math.max(off.y, -c.y + p.size[1] / 2);
+        const bx = partBox(p);
+        off.y = Math.max(off.y, -bx.min[1]);
         o.holder.position.copy(c).add(off);
       } else {
         o.holder.position.copy(c);
@@ -481,7 +502,7 @@ export class Viewport {
   }
 
   private applyDeform(o: PartObj, res: PartResult | undefined) {
-    const want = !!res && res.segments.length > 0 && res.axis !== undefined && beamAxis(o.part) === res.axis;
+    const want = !!res && res.segments.length > 0 && res.axis !== undefined;
     if (!want && !o.deformed) return;
     const mp = o.mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
     const ep = o.edges.geometry.getAttribute('position') as THREE.BufferAttribute;
@@ -494,14 +515,22 @@ export class Viewport {
       return;
     }
     const a = res!.axis!;
-    const c = o.part.pos[a] + o.part.size[a] / 2;
+    const cs = Math.cos(res!.frameYaw);
+    const sn = Math.sin(res!.frameYaw);
+    const q = toQ(o.part.q);
+    const c = new THREE.Vector3(...partCenter(o.part));
+    // world "down" expressed in the part's own coordinates
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q.clone().invert());
+    const v = new THREE.Vector3();
     const apply = (attr: THREE.BufferAttribute, base: Float32Array) => {
       const arr = attr.array as Float32Array;
       for (let i = 0; i < arr.length; i += 3) {
-        const s = base[i + a] + c;
-        arr[i] = base[i];
-        arr[i + 1] = base[i + 1] - shapeAt(s, res!.segments);
-        arr[i + 2] = base[i + 2];
+        v.set(base[i], base[i + 1], base[i + 2]).applyQuaternion(q).add(c);
+        const s = a === 0 ? cs * v.x - sn * v.z : sn * v.x + cs * v.z;
+        const d = shapeAt(s, res!.segments);
+        arr[i] = base[i] - up.x * d;
+        arr[i + 1] = base[i + 1] - up.y * d;
+        arr[i + 2] = base[i + 2] - up.z * d;
       }
       attr.needsUpdate = true;
     };
@@ -550,30 +579,54 @@ export class Viewport {
   }
 
   private updateGizmo(st: ReturnType<typeof useStore.getState>, ids: Set<string>) {
-    if (this.moveDrag) return;
-    const show = st.tool === 'move' && ids.size > 0 && st.explode === 0;
+    if (this.moveDrag || this.rotDrag) return;
+    const show = (st.tool === 'move' || st.tool === 'rotate') && ids.size > 0 && st.explode === 0;
     if (!show) {
       if (this.tc.object) this.tc.detach();
       return;
     }
-    const bb = this.selectionBox(ids)!;
-    // at the base, front edge: clear of the parts you click to select
-    this.pivot.position.set((bb.min[0] + bb.max[0]) / 2, bb.min[1], bb.max[2]);
+    const bb = this.selectionBox(ids);
+    if (!bb) {
+      if (this.tc.object) this.tc.detach();
+      return;
+    }
+    this.pivot.quaternion.identity();
+    const coarse = matchMedia('(pointer: coarse)').matches;
+    if (st.tool === 'rotate') {
+      this.tc.setMode('rotate');
+      this.tc.setSize(coarse ? 1.9 : 1.55);
+      const piv = rotationPivot(st.project, st.selection);
+      this.pivot.position.set(...(piv ? piv.pivot : boxCenter(bb)));
+    } else {
+      this.tc.setMode('translate');
+      this.tc.setSize(coarse ? 1.35 : 1);
+      // at the base, front edge: clear of the parts you click to select
+      this.pivot.position.set((bb.min[0] + bb.max[0]) / 2, bb.min[1], bb.max[2]);
+    }
     this.pivot.updateMatrixWorld();
     if (this.tc.object !== this.pivot) this.tc.attach(this.pivot);
   }
 
-  private resizeTarget(st: ReturnType<typeof useStore.getState>): { part?: Part; groupId?: string } | null {
+  /** the box the handles and tape measures follow */
+  private selectionFrame(st: ReturnType<typeof useStore.getState>, bb: Box3): SelFrame {
     const sel = st.selection;
     if (sel.kind === 'parts' && sel.ids.length === 1) {
       const part = st.project.parts.find((p) => p.id === sel.ids[0]);
-      return part ? { part } : null;
+      if (part) return { c: new THREE.Vector3(...partCenter(part)), q: toQ(part.q), size: [...part.size] as Vec3, part, rot: 0, editable: true };
     }
     if (sel.kind === 'group') {
       const g = st.project.groups.find((x) => x.id === sel.id);
-      if (g && g.template && !g.custom) return { groupId: g.id };
+      if (g && g.template && !g.custom)
+        return { c: new THREE.Vector3(...groupCenter(g)), q: toQ(g.q), size: groupRotExtents(g), groupId: g.id, rot: g.rot, editable: true };
     }
-    return null;
+    return { c: new THREE.Vector3(...boxCenter(bb)), q: new THREE.Quaternion(), size: boxSize(bb), rot: 0, editable: false };
+  }
+
+  /** in a flat elevation view, skip directions pointing straight at the viewer */
+  private facingViewer(dir: THREE.Vector3, view: ViewMode) {
+    if (view === 'persp') return false;
+    const v = view === 'front' ? new THREE.Vector3(0, 0, 1) : view === 'side' ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    return Math.abs(dir.dot(v)) > 0.95;
   }
 
   private buildOverlay(st: ReturnType<typeof useStore.getState>, analysis: ReturnType<typeof analyze> | null) {
@@ -596,21 +649,18 @@ export class Viewport {
 
     // resize handles
     if (!this.resizeDrag && st.tool === 'resize' && st.explode === 0 && bb) {
-      const tgt = this.resizeTarget(st);
-      if (tgt) {
+      const f = this.selectionFrame(st, bb);
+      if (f.editable) {
         const sphere = new THREE.SphereGeometry(1, 20, 14);
-        const c = boxCenter(bb);
-        const hidden = st.view === 'front' ? 2 : st.view === 'side' ? 0 : st.view === 'top' ? 1 : -1;
+        const len = f.part ? beamAxisOrLen(f.part) : -1;
         for (let k = 0; k < 3; k++) {
-          if (k === hidden) continue;
-          if (tgt.part?.shape === 'rod') {
-            const s = tgt.part.size;
-            const len = s[0] >= s[1] && s[0] >= s[2] ? 0 : s[2] >= s[1] ? 2 : 1;
-            if (k !== len) continue;
-          }
+          if (f.part?.shape === 'rod' && k !== len) continue;
           for (const sign of [1, -1] as const) {
-            const base = new THREE.Vector3(...c);
-            base.setComponent(k, sign > 0 ? bb.max[k] : bb.min[k]);
+            const dir = new THREE.Vector3();
+            dir.setComponent(k, sign);
+            dir.applyQuaternion(f.q);
+            if (this.facingViewer(dir, st.view)) continue;
+            const base = f.c.clone().addScaledVector(dir, f.size[k] / 2);
             const mesh = new THREE.Mesh(sphere, this.handleMat);
             const ring = new THREE.Mesh(sphere, this.handleRing);
             ring.scale.setScalar(1.28);
@@ -620,24 +670,40 @@ export class Viewport {
             ring.renderOrder = 1000;
             mesh.userData.handle = true;
             this.overlay.add(mesh);
-            this.handles.push({ mesh, axis: k, sign, base });
+            this.handles.push({ mesh, axis: k, sign, base, dir });
           }
         }
       }
     }
 
+    // live angle while turning
+    if (this.rotDrag) {
+      const ang = Math.round(THREE.MathUtils.radToDeg(2 * Math.acos(Math.min(1, Math.abs(this.pivot.quaternion.w)))));
+      const el = document.createElement('div');
+      el.className = 'tape';
+      el.textContent = `${ang}°`;
+      const lab = new CSS2DObject(el);
+      lab.position.copy(this.pivot.position);
+      lab.center.set(0.5, 2.2);
+      this.overlay.add(lab);
+      this.labels.push(lab);
+    }
+
     // a whole furniture piece is outlined by its bounding box
     if (bb && st.selection.kind === 'group') {
-      const [x0, y0, z0] = bb.min.map((v) => v - 3);
-      const [x1, y1, z1] = bb.max.map((v) => v + 3);
+      // follows the piece's own box when it is turned
+      const f = this.selectionFrame(st, bb);
+      const [hx, hy, hz] = f.size.map((v) => v / 2 + 3);
       const c = [
-        [x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1],
-        [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1],
+        [-hx, -hy, -hz], [hx, -hy, -hz], [hx, -hy, hz], [-hx, -hy, hz],
+        [-hx, hy, -hz], [hx, hy, -hz], [hx, hy, hz], [-hx, hy, hz],
       ];
       const e = [0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7];
       const g = new LineSegmentsGeometry();
       g.setPositions(e.flatMap((i) => c[i]));
       const box = new LineSegments2(g, this.selMat);
+      box.position.copy(f.c);
+      box.quaternion.copy(f.q);
       box.renderOrder = 900;
       box.raycast = () => {};
       if (st.explode === 0) this.overlay.add(box);
@@ -667,7 +733,8 @@ export class Viewport {
         el.addEventListener('pointerdown', (e) => e.stopPropagation());
         el.addEventListener('click', () => useStore.getState().select({ kind: 'parts', ids: [r.id] }));
         const lab = new CSS2DObject(el);
-        lab.position.set(0, o.part.size[1] / 2 + 6, 0);
+        const bx = partBox(o.part);
+        lab.position.set(0, (bx.max[1] - bx.min[1]) / 2 + 6, 0).applyQuaternion(o.holder.quaternion.clone().invert());
         lab.center.set(0.5, 1);
         o.holder.add(lab);
         this.labels.push(lab);
@@ -676,57 +743,62 @@ export class Viewport {
   }
 
   private buildDims(st: ReturnType<typeof useStore.getState>, bb: Box3) {
-    const size = boxSize(bb);
-    const off = THREE.MathUtils.clamp(Math.max(...size) * 0.07, 35, 140);
+    const f = this.selectionFrame(st, bb);
+    const [sx, sy, sz] = f.size;
+    const hx = sx / 2;
+    const hy = sy / 2;
+    const hz = sz / 2;
+    const off = THREE.MathUtils.clamp(Math.max(sx, sy, sz) * 0.07, 35, 140);
     const tick = off * 0.35;
     const pts: number[] = [];
     const seg = (a: THREE.Vector3, b: THREE.Vector3) => pts.push(a.x, a.y, a.z, b.x, b.y, b.z);
-    const tgt = this.resizeTarget(st);
-    const g = tgt?.groupId ? st.project.groups.find((x) => x.id === tgt.groupId) : null;
-    const editable = !!tgt;
-    const y0 = bb.min[1];
+    const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
     // X: along the front bottom edge
-    const xa = new THREE.Vector3(bb.min[0], y0, bb.max[2] + off);
-    const xb = new THREE.Vector3(bb.max[0], y0, bb.max[2] + off);
+    const xa = V(-hx, -hy, hz + off);
+    const xb = V(hx, -hy, hz + off);
     seg(xa, xb);
-    seg(xa.clone().setZ(bb.max[2] + off - tick), xa.clone().setZ(bb.max[2] + off + tick));
-    seg(xb.clone().setZ(bb.max[2] + off - tick), xb.clone().setZ(bb.max[2] + off + tick));
+    seg(V(-hx, -hy, hz + off - tick), V(-hx, -hy, hz + off + tick));
+    seg(V(hx, -hy, hz + off - tick), V(hx, -hy, hz + off + tick));
     // Y: vertical at the front right edge
-    const ya = new THREE.Vector3(bb.max[0] + off, bb.min[1], bb.max[2]);
-    const yb = new THREE.Vector3(bb.max[0] + off, bb.max[1], bb.max[2]);
+    const ya = V(hx + off, -hy, hz);
+    const yb = V(hx + off, hy, hz);
     seg(ya, yb);
-    seg(ya.clone().setX(bb.max[0] + off - tick), ya.clone().setX(bb.max[0] + off + tick));
-    seg(yb.clone().setX(bb.max[0] + off - tick), yb.clone().setX(bb.max[0] + off + tick));
+    seg(V(hx + off - tick, -hy, hz), V(hx + off + tick, -hy, hz));
+    seg(V(hx + off - tick, hy, hz), V(hx + off + tick, hy, hz));
     // Z: along the right bottom edge
-    const za = new THREE.Vector3(bb.max[0] + off, y0, bb.min[2]);
-    const zb = new THREE.Vector3(bb.max[0] + off, y0, bb.max[2]);
+    const za = V(hx + off, -hy, -hz);
+    const zb = V(hx + off, -hy, hz);
     seg(za, zb);
-    seg(za.clone().setX(bb.max[0] + off - tick), za.clone().setX(bb.max[0] + off + tick));
-    seg(zb.clone().setX(bb.max[0] + off - tick), zb.clone().setX(bb.max[0] + off + tick));
+    seg(V(hx + off - tick, -hy, -hz), V(hx + off + tick, -hy, -hz));
+    seg(V(hx + off - tick, -hy, hz), V(hx + off + tick, -hy, hz));
+    const holder = new THREE.Group();
+    holder.position.copy(f.c);
+    holder.quaternion.copy(f.q);
     const lg = new THREE.BufferGeometry();
     lg.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
     const lines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: INK, transparent: true, opacity: 0.7, depthTest: false }));
     lines.renderOrder = 800;
     lines.raycast = () => {};
-    this.overlay.add(lines);
+    holder.add(lines);
+    this.overlay.add(holder);
 
     const mids = [xa.clone().lerp(xb, 0.5), ya.clone().lerp(yb, 0.5), za.clone().lerp(zb, 0.5)];
     const names = ['רוחב', 'גובה', 'עומק'];
-    const hidden = st.view === 'front' ? 2 : st.view === 'side' ? 0 : st.view === 'top' ? 1 : -1;
+    const tgt = f.editable ? { part: f.part, groupId: f.groupId } : null;
     for (let k = 0; k < 3; k++) {
-      if (k === hidden) continue;
+      const dir = new THREE.Vector3();
+      dir.setComponent(k, 1);
+      if (this.facingViewer(dir.applyQuaternion(f.q), st.view)) continue;
       const el = document.createElement('button');
       el.type = 'button';
-      el.className = 'tape' + (editable ? ' editable' : '');
-      el.setAttribute('aria-label', `${names[k]} ${fmt(size[k])} מ״מ`);
-      el.innerHTML = `<span>${fmt(size[k])}</span>`;
+      el.className = 'tape' + (tgt ? ' editable' : '');
+      el.setAttribute('aria-label', `${names[k]} ${fmt(f.size[k])} מ״מ`);
+      el.innerHTML = `<span>${fmt(f.size[k])}</span>`;
       el.addEventListener('pointerdown', (e) => e.stopPropagation());
-      if (editable) {
-        el.addEventListener('click', () => this.editDim(el, k, size[k], tgt!, g?.rot ?? 0));
-      }
+      if (tgt) el.addEventListener('click', () => this.editDim(el, k, f.size[k], tgt, f.rot));
       const lab = new CSS2DObject(el);
       lab.position.copy(mids[k]);
-      this.overlay.add(lab);
+      holder.add(lab);
       this.labels.push(lab);
     }
   }
@@ -773,10 +845,26 @@ export class Viewport {
     for (const h of this.handles) {
       const px = this.pxSize(h.base);
       h.mesh.scale.setScalar(px * 8);
-      const dir = new THREE.Vector3();
-      dir.setComponent(h.axis, h.sign);
-      h.mesh.position.copy(h.base).addScaledVector(dir, px * 22);
+      h.mesh.position.copy(h.base).addScaledVector(h.dir, px * 22);
     }
+  }
+
+  // ───────────────────────────────────────────── rotate
+
+  private startRotate() {
+    const st = useStore.getState();
+    const piv = rotationPivot(st.project, st.selection);
+    if (!piv) return;
+    st.beginTransient();
+    this.rotDrag = { start: st.project, pivot: piv.pivot, floor: piv.floor };
+  }
+
+  private applyRotate() {
+    const d = this.rotDrag;
+    if (!d) return;
+    const st = useStore.getState();
+    const dq = this.pivot.quaternion.clone();
+    st.transient(() => rotateProject(d.start, st.selection, dq, d.pivot, d.floor));
   }
 
   // ───────────────────────────────────────────── move
@@ -827,7 +915,7 @@ export class Viewport {
     const others = useStore
       .getState()
       .project.parts.filter((p) => !exclude.has(p.id))
-      .map((p) => ({ min: p.pos, max: [p.pos[0] + p.size[0], p.pos[1] + p.size[1], p.pos[2] + p.size[2]] }));
+      .map((p) => partBox(p));
     const collides = (o: number[]) =>
       others.some((q) => [0, 1, 2].every((j) => Math.min(q.max[j], box.max[j] + o[j]) - Math.max(q.min[j], box.min[j] + o[j]) > 1));
     for (let k = 0; k < 3; k++) {
@@ -870,7 +958,8 @@ export class Viewport {
     if (axis === 1 && Math.abs(v) < Math.abs(best)) best = -v;
     for (const p of useStore.getState().project.parts) {
       if (exclude.has(p.id)) continue;
-      for (const t of [p.pos[axis], p.pos[axis] + p.size[axis]]) {
+      const b = partBox(p);
+      for (const t of [b.min[axis], b.max[axis]]) {
         if (Math.abs(t - v) < Math.abs(best)) best = t - v;
       }
     }
@@ -999,26 +1088,26 @@ export class Viewport {
 
   private startResize(h: Handle, e: PointerEvent) {
     const st = useStore.getState();
-    const tgt = this.resizeTarget(st);
-    if (!tgt) return;
     const ids = new Set(selectedPartIds(st));
-    const box = this.selectionBox(ids)!;
-    const axis = new THREE.Vector3();
-    axis.setComponent(h.axis, 1);
+    const bb = this.selectionBox(ids);
+    if (!bb) return;
+    const frame = this.selectionFrame(st, bb);
+    if (!frame.editable) return;
     const camDir = new THREE.Vector3();
     this.camera.getWorldDirection(camDir);
-    const n = camDir.clone().sub(axis.clone().multiplyScalar(camDir.dot(axis)));
-    if (n.lengthSq() < 1e-6) n.set(h.axis === 1 ? 0 : 0, h.axis === 1 ? 0 : 1, h.axis === 1 ? 1 : 0);
+    const n = camDir.clone().sub(h.dir.clone().multiplyScalar(camDir.dot(h.dir)));
+    if (n.lengthSq() < 1e-6) n.set(0, 1, 0).cross(h.dir);
+    if (n.lengthSq() < 1e-6) n.set(1, 0, 0);
     n.normalize();
     const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, h.base);
     this.raycaster.setFromCamera(this.ndc(e), this.camera);
     const hit = new THREE.Vector3();
     if (!this.raycaster.ray.intersectPlane(plane, hit)) return;
-    const face = h.sign > 0 ? box.max[h.axis] : box.min[h.axis];
     st.beginTransient();
     this.controls.enabled = false;
     this.renderer.domElement.setPointerCapture?.(e.pointerId);
-    this.resizeDrag = { h, plane, grab: hit.getComponent(h.axis) - face, part: tgt.part, groupId: tgt.groupId, box, pointerId: e.pointerId };
+    const base0 = h.base.clone();
+    this.resizeDrag = { h, plane, base0, grab: hit.clone().sub(base0).dot(h.dir), frame, pointerId: e.pointerId };
   }
 
   private dragResize(e: PointerEvent) {
@@ -1026,33 +1115,39 @@ export class Viewport {
     this.raycaster.setFromCamera(this.ndc(e), this.camera);
     const hit = new THREE.Vector3();
     if (!this.raycaster.ray.intersectPlane(d.plane, hit)) return;
-    const k = d.h.axis;
+    const { h, frame } = d;
+    const k = h.axis;
     const st = useStore.getState();
     const exclude = new Set(selectedPartIds(st));
-    let face = this.snapScalar(hit.getComponent(k) - d.grab, k, exclude);
-    if (d.part) {
-      const p = d.part;
-      const size = [...p.size] as Vec3;
-      const pos = [...p.pos] as Vec3;
-      if (d.h.sign > 0) size[k] = Math.max(3, face - p.pos[k]);
-      else {
-        face = Math.min(face, p.pos[k] + p.size[k] - 3);
-        if (k === 1) face = Math.max(0, face);
-        size[k] = p.pos[k] + p.size[k] - face;
-        pos[k] = face;
+    // how far the face moved outward
+    let delta = hit.clone().sub(d.base0).dot(h.dir) - d.grab;
+    const aligned = 1 - Math.abs(frame.q.w) < 1e-9;
+    if (aligned) {
+      // square to the world: snap the face to nearby parts
+      const face = d.base0.getComponent(k) + h.sign * delta;
+      delta = h.sign * (this.snapScalar(face, k, exclude) - d.base0.getComponent(k));
+    } else {
+      delta = Math.round(delta);
+    }
+    const start = frame.size[k];
+    let size = Math.max(frame.part ? 3 : 120, start + delta);
+    if (frame.part) {
+      const p = frame.part;
+      const nsize = [...p.size] as Vec3;
+      nsize[k] = size;
+      const c = frame.c.clone().addScaledVector(h.dir, (size - start) / 2);
+      let pos = posFromCenter([c.x, c.y, c.z], nsize);
+      if (aligned && k === 1 && h.sign < 0 && pos[1] < 0) {
+        nsize[1] = p.pos[1] + p.size[1];
+        size = nsize[1];
+        pos = [pos[0], 0, pos[2]];
       }
-      if (p.shape === 'rod' && k !== beamAxisOrLen(p)) return;
-      st.transient((pr) => markCustom({ ...pr, parts: pr.parts.map((x) => (x.id === p.id ? { ...x, size: size.map(r1) as Vec3, pos: pos.map(r1) as Vec3 } : x)) }, [p.id]));
-    } else if (d.groupId) {
-      const size = d.h.sign > 0 ? face - d.box.min[k] : d.box.max[k] - face;
-      st.resizeGroupAxis(d.groupId, k, Math.max(120, size), d.h.sign < 0);
+      st.transient((pr) => markCustom({ ...pr, parts: pr.parts.map((x) => (x.id === p.id ? { ...x, size: nsize.map(r1) as Vec3, pos: pos.map(r1) as Vec3 } : x)) }, [p.id]));
+    } else if (frame.groupId) {
+      st.resizeGroupAxis(frame.groupId, k, size, h.sign < 0);
     }
-    // move the grabbed handle with the face
-    const nb = this.selectionBox(exclude);
-    if (nb) {
-      const c = boxCenter(nb);
-      d.h.base.set(c[0], c[1], c[2]).setComponent(k, d.h.sign > 0 ? nb.max[k] : nb.min[k]);
-    }
+    // the grabbed handle follows its face
+    h.base.copy(frame.c).addScaledVector(h.dir, size - start / 2);
     this.dirty = true;
   }
 

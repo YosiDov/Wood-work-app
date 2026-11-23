@@ -11,6 +11,7 @@ import {
   Move,
   Plus,
   Redo2,
+  RotateCw,
   Ruler,
   Save,
   Sheet,
@@ -20,7 +21,7 @@ import {
 import { useStore } from '../model/store';
 import type { PartKind, ViewMode } from '../model/types';
 import { TEMPLATES } from '../model/templates';
-import { cutList } from '../model/cutlist';
+import { cutLabel, cutList } from '../model/cutlist';
 import { SHEET_AREA_M2, wood } from '../model/woods';
 import { ExplodeIcon, Logo, PartIcon, ResizeIcon, StrengthIcon, TemplateIcon } from './icons';
 import { WoodSwatch } from './controls';
@@ -171,6 +172,10 @@ export const BottomBar = () => {
         <button type="button" role="radio" aria-checked={tool === 'move'} className={`dock-btn ${tool === 'move' ? 'on' : ''}`} onClick={() => st.set({ tool: 'move' })} title="הזזה (G)">
           <Move size={19} />
           <span>הזזה</span>
+        </button>
+        <button type="button" role="radio" aria-checked={tool === 'rotate'} className={`dock-btn ${tool === 'rotate' ? 'on' : ''}`} onClick={() => st.set({ tool: 'rotate' })} title="סיבוב (R)">
+          <RotateCw size={19} />
+          <span>סיבוב</span>
         </button>
         <button type="button" role="radio" aria-checked={tool === 'resize'} className={`dock-btn ${tool === 'resize' ? 'on' : ''}`} onClick={() => st.set({ tool: 'resize' })} title="מתיחה (S)">
           <ResizeIcon size={19} />
@@ -331,6 +336,7 @@ export const CutListPanel = () => {
                 <th>אורך</th>
                 <th>רוחב</th>
                 <th>עובי</th>
+                <th>זווית</th>
                 <th>חומר</th>
                 <th>ק״ג</th>
               </tr>
@@ -343,6 +349,7 @@ export const CutListPanel = () => {
                   <td className="n">{Math.round(r.L * 10) / 10}</td>
                   <td className="n">{r.round ? `Ø${Math.round(r.W * 10) / 10}` : Math.round(r.W * 10) / 10}</td>
                   <td className="n">{r.round ? '' : Math.round(r.T * 10) / 10}</td>
+                  <td className="n">{cutLabel(r.angles)}</td>
                   <td>
                     <span className="mat-cell">
                       <WoodSwatch id={r.wood} size={18} />
@@ -369,7 +376,7 @@ export const CutListPanel = () => {
             </div>
           ))}
         </div>
-        <p className="hint">מידות במ״מ. גיליון = 244×122 ס״מ ({Math.round(SHEET_AREA_M2 * 100) / 100} מ״ר), כולל 15% פחת. המחירים הם הערכה; אפשר לעדכן מחיר למ״ק.</p>
+        <p className="hint">מידות במ״מ; חלק עם קצוות בזווית נמדד מקצה לקצה הארוך. זווית = כמה להטות את המסור מחיתוך ישר. גיליון = 244×122 ס״מ ({Math.round(SHEET_AREA_M2 * 100) / 100} מ״ר), כולל 15% פחת. המחירים הם הערכה; אפשר לעדכן מחיר למ״ק.</p>
       </div>
     </div>
   );
@@ -415,8 +422,11 @@ export const HelpPanel = () => {
     ['עיגולים צהובים', 'במצב מתיחה: גוררים כדי לשנות מידה'],
     ['סרט מדידה צהוב', 'לוחצים על המספר כדי להקליד מידה'],
     ['שדות מספר', 'אפשר לכתוב חשבון, למשל 900-2*18'],
-    ['G / S', 'הזזה / מתיחה'],
-    ['R', 'סיבוב 90°'],
+    ['טבעות צבעוניות', 'במצב סיבוב: גוררים כדי לסובב (נצמד כל 15°). זווית מדויקת: בשדות ״סיבוב״ בצד'],
+    ['G · R · S', 'הזזה · סיבוב · מתיחה'],
+    ['R שוב', 'סיבוב 90° (Shift+R לכיוון השני)'],
+    ['Shift+לחיצה · Ctrl+A', 'בחירת כמה חלקים · בחירת הכל'],
+    ['Ctrl+G', 'קיבוץ החלקים הנבחרים לרהיט אחד'],
     ['Ctrl+D · Delete', 'שכפול · מחיקה'],
     ['Ctrl+Z · Ctrl+Y', 'ביטול · שחזור'],
     ['חיצים · PageUp/Down', 'הזזה של 10 מ״מ (Shift: 1 מ״מ)'],

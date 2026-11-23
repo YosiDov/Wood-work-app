@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { Part } from '../model/types';
 import { wood } from '../model/woods';
-import { longestAxis, shortestAxis } from '../model/geometry';
+import { applyCut, hasCut, longestAxis, shortestAxis } from '../model/geometry';
 
 /**
  * Box geometry centred at the origin with UVs in real millimetres, so the grain runs along the
@@ -82,6 +82,18 @@ export const buildPartGeometry = (
       }
     }
   }
+  if (hasCut(part)) {
+    const pt = [0, 0, 0];
+    for (let i = 0; i < pos.length; i += 3) {
+      pt[0] = pos[i];
+      pt[1] = pos[i + 1];
+      pt[2] = pos[i + 2];
+      applyCut(pt, size, part.cut);
+      pos[i] = pt[0];
+      pos[i + 1] = pt[1];
+      pos[i + 2] = pt[2];
+    }
+  }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
@@ -89,6 +101,7 @@ export const buildPartGeometry = (
   g.setIndex([...idx[0], ...idx[1]]);
   g.addGroup(0, idx[0].length, 0);
   g.addGroup(idx[0].length, idx[1].length, 1);
+  if (hasCut(part)) g.computeVertexNormals();
   return g;
 };
 

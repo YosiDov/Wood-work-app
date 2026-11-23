@@ -790,6 +790,10 @@ button:disabled {
   gap: 8px;
 }
 
+.fields3.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .num {
   display: flex;
   flex-direction: column;
@@ -879,10 +883,23 @@ button:disabled {
   margin: 0;
 }
 
-.actions {
+.actions,
+.rot-steps {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 6px;
+}
+
+.rot-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tip-side {
+  display: inline-flex;
+  transform: rotate(90deg);
 }
 
 .act {
@@ -1463,7 +1480,7 @@ button:disabled {
 
 .tpl-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   padding: 16px 20px 22px;
   overflow-y: auto;

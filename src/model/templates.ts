@@ -1,5 +1,6 @@
-import type { Group, LoadType, MatRole, ParamValue, Part, PartKind, Role, Shape, TemplateId, Vec3, WoodId } from './types';
-import { hashSeed, rotateBoxY } from './geometry';
+import type { Group, LoadType, MatRole, ParamValue, Part, PartKind, Quat, Role, Shape, TemplateId, Vec3, WoodId } from './types';
+import { bakeQuarter, fromQ, hashSeed, isIdentityQ, posFromCenter, rotateBoxY, toQ } from './geometry';
+import { Quaternion, Vector3 } from 'three';
 
 export interface ParamSpec {
   key: string;
@@ -21,6 +22,9 @@ export interface GenPart {
   load?: number | null;
   loadType?: LoadType;
   kind?: PartKind;
+  /** own rotation about the part's centre */
+  q?: Quat;
+  cut?: [number, number];
 }
 
 export interface TemplateDef {
@@ -113,6 +117,77 @@ export const TEMPLATES: TemplateDef[] = [
         out.push(box(`מדף ${i + 1}`, t, y0 + gap * (i + 1) + t * i, bt, W - 2 * t, t, cd - 10, 'wood', { kind: 'sheet' }));
       }
       if (bt) out.push(box('גב', 0, 0, 0, W, H, bt, 'backWood', { kind: 'sheet' }));
+      return out;
+    },
+  },
+  {
+    id: 'xshelf',
+    name: 'מדף איקסים',
+    params: [
+      ...DIMS,
+      { key: 'shelves', label: 'מדפים', kind: 'int', min: 2, max: 8, step: 1 },
+      { key: 'st', label: 'עובי מדף', kind: 'num', min: 18, max: 60, step: 1 },
+      { key: 'post', label: 'רוחב עמוד', kind: 'num', min: 38, max: 140, step: 1 },
+      { key: 'inset', label: 'בליטת מדף מהעמוד', kind: 'num', min: 0, max: 250, step: 5 },
+      { key: 'low', label: 'גובה מדף תחתון', kind: 'num', min: 0, max: 500, step: 5 },
+      { key: 'top', label: 'עמוד מעל המדף', kind: 'num', min: 0, max: 400, step: 5 },
+      { key: 'bw', label: 'רוחב איקס', kind: 'num', min: 30, max: 120, step: 1 },
+      { key: 'braces', label: 'איקסים בצדדים', kind: 'bool' },
+    ],
+    materials: { wood: 'עמודים', topWood: 'מדפים', backWood: 'איקסים' },
+    // 50"H × 48"W × 12"D barnwood shelf: 2×4 posts, 2×10 shelves, 1×3 braces
+    defaults: { W: 1220, H: 1270, D: 310, shelves: 4, st: 38, post: 89, inset: 75, low: 150, top: 150, bw: 64, braces: true, wood: 'pine', topWood: 'pine', backWood: 'pine' },
+    build: (p) => {
+      const W = n(p, 'W'), H = n(p, 'H'), D = n(p, 'D');
+      const count = Math.max(2, n(p, 'shelves'));
+      const st = n(p, 'st'), pw = n(p, 'post'), inset = n(p, 'inset'), low = n(p, 'low'), top = n(p, 'top'), bw = n(p, 'bw');
+      const pt = 38; // post thickness front to back (a 2×4 on edge)
+      const sd = Math.max(60, D - 2 * pt);
+      const out: GenPart[] = [];
+      const xs = [inset, W - inset - pw];
+      // posts sandwich the shelves: back posts behind, front posts in front
+      out.push(box('עמוד אחורי שמאל', xs[0], 0, 0, pw, H, pt, 'wood', { kind: 'beam' }));
+      out.push(box('עמוד אחורי ימין', xs[1], 0, 0, pw, H, pt, 'wood', { kind: 'beam' }));
+      out.push(box('עמוד קדמי שמאל', xs[0], 0, pt + sd, pw, H, pt, 'wood', { kind: 'beam' }));
+      out.push(box('עמוד קדמי ימין', xs[1], 0, pt + sd, pw, H, pt, 'wood', { kind: 'beam' }));
+      const gap = (H - top - st - low) / (count - 1);
+      const ys: number[] = [];
+      for (let i = 0; i < count; i++) {
+        const y = low + i * gap;
+        ys.push(y);
+        out.push(box(`מדף ${i + 1}`, 0, y, pt, W, st, sd, 'topWood', { kind: 'board' }));
+      }
+      if (b(p, 'braces')) {
+        const bt = 19;
+        for (let i = 0; i < count - 1; i++) {
+          const y0 = ys[i] + st;
+          const by = ys[i + 1] - y0;
+          // brace angle from vertical so both ends sit flat in the corners of the bay:
+          // tan φ = (depth − bw / cos φ) / height
+          let phi = Math.atan2(sd, by);
+          for (let k = 0; k < 30; k++) phi = Math.atan2(Math.max(1, sd - bw / Math.cos(phi)), by);
+          if (sd - bw / Math.cos(phi) < 10) continue;
+          const L = by / Math.cos(phi) + bw * Math.tan(phi);
+          const deg = (phi * 180) / Math.PI;
+          for (const [si, x] of [[0, xs[0]], [1, xs[1] + pw - bt]] as const) {
+            const side = si === 0 ? 'שמאל' : 'ימין';
+            for (const sgn of [1, -1]) {
+              const q = fromQ(new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), sgn * phi));
+              const cy = y0 + by / 2;
+              const cz = pt + sd / 2;
+              out.push({
+                name: `איקס ${side} ${i + 1}`,
+                pos: [x, cy - L / 2, cz - bw / 2],
+                size: [bt, L, bw],
+                matRole: 'backWood',
+                kind: 'board',
+                q,
+                cut: [sgn * deg, sgn * deg],
+              });
+            }
+          }
+        }
+      }
       return out;
     },
   },
@@ -363,10 +438,21 @@ export const buildGroupParts = (g: Group): Part[] => {
   const gen = def.build(p);
   const W = Number(p.W);
   const D = Number(p.D);
-  return gen
+  const C = groupCenter(g);
+  const gq = isIdentityQ(g.q) ? null : toQ(g.q);
+  const parts = gen
     .filter((gp) => gp.size.every((s) => s > 0.5))
     .map((gp, i) => {
-      const r = rotateBoxY(gp.pos, gp.size, W, D, g.rot);
+      let r = rotateBoxY(gp.pos, gp.size, W, D, g.rot);
+      let partQ: Quat | undefined;
+      if (gp.q && !isIdentityQ(gp.q)) {
+        // turned parts keep their own box size; the quarter turn joins their rotation
+        const c: Vec3 = [r.pos[0] + r.size[0] / 2, r.pos[1] + r.size[1] / 2, r.pos[2] + r.size[2] / 2];
+        const yaw = new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), ((((g.rot % 4) + 4) % 4) * Math.PI) / 2);
+        const baked = bakeQuarter(gp.size, fromQ(yaw.multiply(toQ(gp.q))));
+        r = { pos: posFromCenter(c, baked.size), size: baked.size };
+        partQ = baked.q;
+      }
       const id = `${g.id}-${i}`;
       const woodId = (p[gp.matRole] ?? p.wood ?? 'pine') as WoodId;
       const part: Part = {
@@ -384,9 +470,30 @@ export const buildGroupParts = (g: Group): Part[] => {
         seed: hashSeed(id + gp.name),
         kind: gp.kind ?? 'board',
         matRole: gp.matRole,
+        q: partQ,
+        cut: gp.cut,
       };
       return part;
     });
+  if (!gq) return parts;
+  // turn the whole piece about its centre
+  return parts.map((part) => {
+    const c = new Vector3(part.pos[0] + part.size[0] / 2, part.pos[1] + part.size[1] / 2, part.pos[2] + part.size[2] / 2);
+    c.sub(new Vector3(...C)).applyQuaternion(gq).add(new Vector3(...C));
+    const q = fromQ(gq.clone().multiply(toQ(part.q)));
+    return { ...part, pos: posFromCenter([c.x, c.y, c.z], part.size), q: isIdentityQ(q) ? undefined : q };
+  });
+};
+
+/** extents of a template piece after its quarter turns (before the free rotation) */
+export const groupRotExtents = (g: Group): Vec3 => {
+  const e = groupExtents(g);
+  return ((g.rot % 4) + 4) % 2 ? [e[2], e[1], e[0]] : e;
+};
+
+export const groupCenter = (g: Group): Vec3 => {
+  const e = groupRotExtents(g);
+  return [g.origin[0] + e[0] / 2, g.origin[1] + e[1] / 2, g.origin[2] + e[2] / 2];
 };
 
 /** which template parameter a world axis maps to, given the group's rotation */

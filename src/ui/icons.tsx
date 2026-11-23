@@ -68,6 +68,14 @@ export const TemplateIcon = ({ id, ...p }: P & { id: TemplateId }) => {
           <path d="M7.5 7.5V4.6M9 7.5V5M10.2 7.5V4.8M14 12V9.5l1.6-.4.6 2.9" opacity=".6" />
         </S>
       );
+    case 'xshelf':
+      return (
+        <S {...p}>
+          <path d="M5 2.5v19M8 2.5v19M16 2.5v19M19 2.5v19" />
+          <path d="M3 7h18M3 13h18M3 19h18" />
+          <path d="M16 7.6l3 4.8M19 7.6l-3 4.8M16 13.6l3 4.8M19 13.6l-3 4.8" opacity=".7" />
+        </S>
+      );
     case 'wardrobe':
       return (
         <S {...p}>

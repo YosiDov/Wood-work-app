@@ -6,8 +6,11 @@
 
 ## מה יש בפנים
 
-- **תבניות פרמטריות** – כוננית, ארון בגדים, מטבח תחתון ועליון, שולחן, ספסל, מגירה, ארגז. משנים רוחב/גובה/עומק/מדפים והרהיט נבנה מחדש.
+- **תבניות פרמטריות** – כוננית, מדף איקסים, ארון בגדים, מטבח תחתון ועליון, שולחן, ספסל, מגירה, ארגז. משנים רוחב/גובה/עומק/מדפים והרהיט נבנה מחדש.
 - **חלקים בודדים** – קרש, לוח, קורה, מוט עגול. הזזה עם חיצים (נצמד לחלקים סמוכים), מתיחה עם ידיות צהובות, הקלדת מידה על סרט המדידה.
+- **סיבוב** – של חלק בודד, של כמה חלקים יחד (Shift+לחיצה או Ctrl+A) או של רהיט שלם: טבעות סיבוב שנצמדות כל 15°, כפתורי 90°, ושדות לזווית מדויקת.
+- **חיתוך בזווית בקצוות** – לכל קרש אפשר לקבוע זווית לכל קצה (למשל האיקסים במדף), כולל ברשימת החיתוך.
+- **מדף איקסים** – תבנית למדף כפרי עם עמודים, מדפים עבים ואיקסים בצדדים; זווית האיקסים מחושבת לפי גובה כל קומה.
 - **13 סוגי עץ ולוחות** – אורן, אלון, בוק, אגוז, מייפל, דובדבן, טיק, עץ אדום, דיקט ליבנה, סנדוויץ׳, MDF, מלמין, OSB.
 - **בדיקת חוזק** – כל מדף מציג כמה ק״ג הוא מחזיק; צבע ירוק/צהוב/אדום ושקיעה מוגדלת ×10.
 - **רשימת חיתוך** – כמויות, מידות, משקל, מספר גיליונות ועלות משוערת; ייצוא ל-CSV.
@@ -22,6 +25,8 @@
   - ULS: `σ = (1.35·M_G + 1.5·M_Q)/W ≤ k_mod·f_m,k/γ_M`
   - SLS: `δ_fin = δ_G(1+k_def) + δ_Q(1+ψ₂·k_def) ≤ L/300` (cantilever `L/150`); distributed loads are long-term (ψ₂ = 1), point loads short-term.
 - Columns: EN 1995 §6.3.2 buckling factor `k_c`, effective length between bracing points.
+- Posts screwed to a board's front/back edge support it at that spot (wide panels such as a nailed-on back do not).
+- Furniture turned about the vertical axis is checked in its own frame; tilted parts (braces, angled boards) are shown as "בזווית" and not calculated.
 - Material values: EN 338 classes (C24, D30–D40), EN 1995 tables 3.1/3.2 for `k_mod`/`k_def`, typical EN 636 / 622-5 / 312 / 300 panel values.
 
 This is a design aid. For furniture people stand on or hang from, have an engineer check it.

@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import type { Group, MatRole, ParamValue, Part, PartKind, Project, Selection, TemplateId, Tool, Vec3, ViewMode, WoodId } from './types';
-import { boxCenter, boxOfParts, boxSize, hashSeed, uid } from './geometry';
-import { TEMPLATE_MAP, axisParam, buildGroupParts, groupExtents } from './templates';
+import { Quaternion, Vector3 } from 'three';
+import { anglesToQuat, bakeQuarter, boxCenter, boxOfParts, boxSize, fromQ, hashSeed, isIdentityQ, partCenter, posFromCenter, toQ, uid } from './geometry';
+import { TEMPLATE_MAP, axisParam, buildGroupParts, groupCenter, groupRotExtents } from './templates';
 
 export type Panel = null | 'templates' | 'cutlist' | 'help' | 'file';
 
@@ -50,7 +51,10 @@ interface Actions {
   resizeGroupAxis: (groupId: string, axis: number, size: number, fromMin: boolean) => void;
   deleteSelection: () => void;
   duplicateSelection: () => void;
-  rotateSelection: (axis: 0 | 1 | 2) => void;
+  rotateSelection: (axis: 0 | 1 | 2, deg?: number) => void;
+  /** set the absolute angles (yaw, tilt X, tilt Z in degrees) of the selected part or piece */
+  setRotation: (angles: Vec3) => void;
+  selectAll: () => void;
   nudgeSelection: (d: Vec3) => void;
   groupSelection: () => void;
   ungroup: (groupId: string) => void;
@@ -131,6 +135,81 @@ export const markCustom = (p: Project, partIds: string[]): Project => {
 };
 
 let toastId = 0;
+
+/** the whole rotation of a template piece: its quarter turns, then its free rotation */
+export const groupTotalQ = (g: Group): Quaternion =>
+  toQ(g.q).multiply(new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), ((((g.rot % 4) + 4) % 4) * Math.PI) / 2));
+
+/** centre to turn the selection about, and the floor level it rests on */
+export const rotationPivot = (p: Project, sel: Selection): { pivot: Vec3; floor: number } | null => {
+  const ids = selectedPartIds({ selection: sel, project: p });
+  const bb = boxOfParts(p.parts.filter((x) => ids.includes(x.id)));
+  if (!bb) return null;
+  if (sel.kind === 'group') {
+    const g = p.groups.find((x) => x.id === sel.id);
+    if (g?.template && !g.custom) return { pivot: groupCenter(g), floor: bb.min[1] };
+  }
+  return { pivot: boxCenter(bb), floor: bb.min[1] };
+};
+
+const r1 = (v: number) => Math.round(v * 10) / 10;
+
+/** pure yaw of a whole number of quarter turns → that number, else null */
+const quarterYaw = (q: Quaternion): number | null => {
+  if (Math.abs(q.x) > 1e-6 || Math.abs(q.z) > 1e-6) return null;
+  const a = 2 * Math.atan2(q.y, q.w);
+  const n = Math.round(a / (Math.PI / 2));
+  return Math.abs(a - (n * Math.PI) / 2) < 1e-6 ? n : null;
+};
+
+/**
+ * Turn the selection by `dq` about `pivot`, keeping its lowest point at `floor`. Turns that land on
+ * whole 90° steps are folded back into plain axis-aligned boards.
+ */
+export const rotateProject = (p: Project, sel: Selection, dq: Quaternion, pivot: Vec3, floor: number | null): Project => {
+  const P = new Vector3(...pivot);
+  if (sel.kind === 'group') {
+    const g = p.groups.find((x) => x.id === sel.id);
+    // hand-edited pieces turn part by part so the edits survive
+    if (g?.template && !g.custom) {
+      let q = dq.clone().multiply(toQ(g.q)).normalize();
+      let rot = g.rot;
+      const n = quarterYaw(q);
+      if (n !== null) {
+        rot = (((rot + n) % 4) + 4) % 4;
+        q = new Quaternion();
+      }
+      const c = new Vector3(...groupCenter(g)).sub(P).applyQuaternion(dq).add(P);
+      let ng: Group = { ...g, rot, q: isIdentityQ(fromQ(q)) ? undefined : fromQ(q) };
+      ng.origin = posFromCenter([c.x, c.y, c.z], groupRotExtents(ng)).map(r1) as Vec3;
+      if (floor !== null) {
+        const bb = boxOfParts(buildGroupParts(ng));
+        if (bb) ng = { ...ng, origin: [ng.origin[0], r1(ng.origin[1] + floor - bb.min[1]), ng.origin[2]] };
+      }
+      return withGroupParts(p, ng);
+    }
+  }
+  const ids = new Set(selectedPartIds({ selection: sel, project: p }));
+  const moved = new Map<string, Part>();
+  for (const x of p.parts) {
+    if (!ids.has(x.id)) continue;
+    const c = new Vector3(...partCenter(x)).sub(P).applyQuaternion(dq).add(P);
+    const q = fromQ(dq.clone().multiply(toQ(x.q)));
+    const baked = bakeQuarter(x.size, q);
+    moved.set(x.id, { ...x, size: baked.size, q: baked.q, pos: posFromCenter([c.x, c.y, c.z], baked.size) });
+  }
+  let dy = 0;
+  if (floor !== null) {
+    const bb = boxOfParts([...moved.values()]);
+    if (bb) dy = floor - bb.min[1];
+  }
+  const parts = p.parts.map((x) => {
+    const m = moved.get(x.id);
+    return m ? { ...m, pos: [r1(m.pos[0]), r1(m.pos[1] + dy), r1(m.pos[2])] as Vec3 } : x;
+  });
+  const next = { ...p, parts };
+  return sel.kind === 'parts' ? markCustom(next, [...ids]) : next;
+};
 
 export const useStore = create<State & Actions>((set, get) => ({
   project: loadSaved() ?? sampleProject(),
@@ -290,11 +369,16 @@ export const useStore = create<State & Actions>((set, get) => ({
     const g = st.project.groups.find((x) => x.id === gid);
     if (!g || !g.template) return;
     const key = axisParam(g.rot, axis);
-    const ext = groupExtents(g);
-    const rotExt: Vec3 = g.rot % 2 ? [ext[2], ext[1], ext[0]] : ext;
+    const rotExt = groupRotExtents(g);
     const delta = size - rotExt[axis];
-    const origin: Vec3 = [...g.origin];
-    if (fromMin) origin[axis] -= delta;
+    // the opposite face stays put: move the centre half the change along the piece's own axis
+    const shift = new Vector3();
+    shift.setComponent(axis, ((fromMin ? -1 : 1) * delta) / 2);
+    shift.applyQuaternion(toQ(g.q));
+    const c = groupCenter(g);
+    const nRot = [...rotExt] as Vec3;
+    nRot[axis] = size;
+    const origin = posFromCenter([c[0] + shift.x, c[1] + shift.y, c[2] + shift.z], nRot);
     const ng: Group = { ...g, origin, params: { ...g.params, [key]: Math.round(size) }, custom: false };
     st.transient((p) => withGroupParts(p, ng));
   },
@@ -338,50 +422,39 @@ export const useStore = create<State & Actions>((set, get) => ({
     }
   },
 
-  rotateSelection: (axis) => {
+  rotateSelection: (axis, deg = 90) => {
+    const st = get();
+    if (st.selection.kind === 'none') return;
+    const dq = new Quaternion().setFromAxisAngle(new Vector3(axis === 0 ? 1 : 0, axis === 1 ? 1 : 0, axis === 2 ? 1 : 0), (deg * Math.PI) / 180);
+    const piv = rotationPivot(st.project, st.selection);
+    if (!piv) return;
+    get().commit((p) => rotateProject(p, st.selection, dq, piv.pivot, piv.floor));
+  },
+
+  setRotation: (angles) => {
     const st = get();
     const sel = st.selection;
-    if (sel.kind === 'none') return;
-    const ids = selectedPartIds(st);
-    const sp = st.project.parts.filter((x) => ids.includes(x.id));
-    const bb = boxOfParts(sp);
-    if (!bb) return;
-    const c = boxCenter(bb);
-    if (sel.kind === 'group' && axis === 1) {
-      const g = st.project.groups.find((x) => x.id === sel.id)!;
-      if (g.template && !g.custom) {
-        const ext = groupExtents(g);
-        const rot = (g.rot + 1) % 4;
-        const nExt: Vec3 = rot % 2 ? [ext[2], ext[1], ext[0]] : ext;
-        const ng: Group = { ...g, rot, origin: [Math.round(c[0] - nExt[0] / 2), g.origin[1], Math.round(c[2] - nExt[2] / 2)] };
-        get().commit((p) => withGroupParts(p, ng));
-        return;
-      }
-    }
-    // rotate every part box 90° about the selection centre
-    const [a, b] = axis === 1 ? [0, 2] : axis === 0 ? [1, 2] : [0, 1];
-    const rotated = new Map<string, Part>();
-    for (const x of sp) {
-      const size: Vec3 = [...x.size];
-      size[a] = x.size[b];
-      size[b] = x.size[a];
-      const pc: Vec3 = [x.pos[0] + x.size[0] / 2, x.pos[1] + x.size[1] / 2, x.pos[2] + x.size[2] / 2];
-      const rel = [pc[a] - c[a], pc[b] - c[b]];
-      const nc: Vec3 = [...pc];
-      nc[a] = c[a] - rel[1];
-      nc[b] = c[b] + rel[0];
-      const pos: Vec3 = [nc[0] - size[0] / 2, nc[1] - size[1] / 2, nc[2] - size[2] / 2];
-      rotated.set(x.id, { ...x, size, pos: pos.map((v) => Math.round(v * 10) / 10) as Vec3 });
-    }
-    // keep resting on the same floor level
-    const nb = boxOfParts([...rotated.values()])!;
-    const dy = bb.min[1] - nb.min[1];
-    get().commit((p) =>
-      markCustom(
-        { ...p, parts: p.parts.map((x) => (rotated.has(x.id) ? { ...rotated.get(x.id)!, pos: [rotated.get(x.id)!.pos[0], rotated.get(x.id)!.pos[1] + dy, rotated.get(x.id)!.pos[2]] as Vec3 } : x)) },
-        sel.kind === 'parts' ? ids : [],
-      ),
-    );
+    const target = toQ(anglesToQuat(angles));
+    let current: Quaternion;
+    if (sel.kind === 'group') {
+      const g = st.project.groups.find((x) => x.id === sel.id);
+      if (!g) return;
+      current = groupTotalQ(g);
+    } else if (sel.kind === 'parts' && sel.ids.length === 1) {
+      const part = st.project.parts.find((x) => x.id === sel.ids[0]);
+      if (!part) return;
+      current = toQ(part.q);
+    } else return;
+    const dq = target.multiply(current.invert());
+    const piv = rotationPivot(st.project, sel);
+    if (!piv) return;
+    get().commit((p) => rotateProject(p, sel, dq, piv.pivot, piv.floor));
+  },
+
+  selectAll: () => {
+    const st = get();
+    const ids = st.project.parts.map((p) => p.id);
+    set({ selection: ids.length ? { kind: 'parts', ids } : { kind: 'none' } });
   },
 
   nudgeSelection: (d) => {

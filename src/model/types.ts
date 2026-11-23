@@ -1,5 +1,8 @@
 export type Vec3 = [number, number, number];
 
+/** rotation as a unit quaternion [x, y, z, w] */
+export type Quat = [number, number, number, number];
+
 export type WoodId =
   | 'pine'
   | 'oak'
@@ -45,6 +48,13 @@ export interface Part {
   seed: number;
   kind: PartKind;
   matRole?: MatRole;
+  /** rotation about the part's centre (centre = pos + size / 2); absent = not rotated */
+  q?: Quat;
+  /**
+   * angled end cuts in degrees [start end, far end], turning each end face about the board's
+   * thickness. Equal values give parallel ends; 0 = square. The length is long point to long point.
+   */
+  cut?: [number, number];
 }
 
 export type ParamValue = number | boolean | string;
@@ -58,12 +68,15 @@ export interface Group {
   origin: Vec3;
   /** quarter turns about Y */
   rot: number;
+  /** free rotation of the whole piece about its centre, applied after `rot` */
+  q?: Quat;
   /** true when a part was edited by hand after generation */
   custom: boolean;
 }
 
 export type TemplateId =
   | 'bookcase'
+  | 'xshelf'
   | 'wardrobe'
   | 'kitchenBase'
   | 'kitchenWall'
@@ -89,4 +102,4 @@ export type Selection =
   | { kind: 'parts'; ids: string[] };
 
 export type ViewMode = 'persp' | 'front' | 'side' | 'top';
-export type Tool = 'move' | 'resize';
+export type Tool = 'move' | 'rotate' | 'resize';
